@@ -5,7 +5,10 @@ import (
 	"time"
 
 	"sipres/config"
+	"sipres/internal/handler"
 	"sipres/internal/middleware"
+	"sipres/internal/repository"
+	"sipres/internal/service"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -18,6 +21,11 @@ var jwtSecret = []byte("secret_key")
 func main() {
 	// connect database
 	config.ConnectDB()
+
+	// setup clean architecture
+	repo := &repository.AttendanceRepository{DB: config.DB}
+	svc := &service.AttendanceService{Repo: repo}
+	h := &handler.AttendanceHandler{Service: svc}
 
 	r := gin.Default()
 
@@ -50,23 +58,15 @@ func main() {
 			return
 		}
 
-		// hash password
-		hashedPassword, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed hashing"})
-			return
-		}
+		hashedPassword, _ := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 
-		// insert ke database
 		result, err := config.DB.Exec(
 			"INSERT INTO users (name, email, password, role) VALUES (?, ?, ?, ?)",
 			input.Name, input.Email, string(hashedPassword), "user",
 		)
 
 		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": err.Error(),
-			})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 
@@ -79,7 +79,7 @@ func main() {
 	})
 
 	// =========================
-	// LOGIN + JWT
+	// LOGIN
 	// =========================
 	r.POST("/login", func(c *gin.Context) {
 		var input struct {
@@ -87,10 +87,7 @@ func main() {
 			Password string `json:"password"`
 		}
 
-		if err := c.ShouldBindJSON(&input); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid input"})
-			return
-		}
+		c.ShouldBindJSON(&input)
 
 		var user struct {
 			ID       int
@@ -110,51 +107,31 @@ func main() {
 			return
 		}
 
-		// compare password
-		err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password))
-		if err != nil {
+		if bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)) != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "wrong password"})
 			return
 		}
 
-		// =========================
-		// GENERATE JWT
-		// =========================
 		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 			"user_id": user.ID,
 			"email":   user.Email,
 			"role":    user.Role,
-			"exp":     time.Now().Add(time.Hour * 24).Unix(),
+			"exp":     time.Now().Add(24 * time.Hour).Unix(),
 		})
 
-		tokenString, err := token.SignedString(jwtSecret)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed generate token"})
-			return
-		}
+		tokenString, _ := token.SignedString(jwtSecret)
 
-		// =========================
-		// RESPONSE
-		// =========================
 		c.JSON(http.StatusOK, gin.H{
 			"message": "login success",
 			"token":   tokenString,
-			"user": gin.H{
-				"id":    user.ID,
-				"name":  user.Name,
-				"email": user.Email,
-				"role":  user.Role,
-			},
 		})
 	})
 
 	// =========================
-	// PROTECTED ROUTE
+	// PROFILE
 	// =========================
 	r.GET("/profile", middleware.AuthMiddleware(), func(c *gin.Context) {
-
-		// ambil user_id dari middleware
-		userID := c.GetFloat64("user_id")
+		userID := int(c.GetFloat64("user_id"))
 
 		var user struct {
 			ID    int
@@ -163,10 +140,9 @@ func main() {
 			Role  string
 		}
 
-		// ambil dari database
 		err := config.DB.QueryRow(
 			"SELECT id, name, email, role FROM users WHERE id = ?",
-			int(userID),
+			userID,
 		).Scan(&user.ID, &user.Name, &user.Email, &user.Role)
 
 		if err != nil {
@@ -174,12 +150,18 @@ func main() {
 			return
 		}
 
-		// response
 		c.JSON(http.StatusOK, gin.H{
 			"message": "profile fetched",
 			"user":    user,
 		})
 	})
+
+	// =========================
+	// ATTENDANCE (CLEAN)
+	// =========================
+	r.POST("/checkin", middleware.AuthMiddleware(), h.Checkin)
+	r.POST("/checkout", middleware.AuthMiddleware(), h.Checkout)
+	r.GET("/attendance", middleware.AuthMiddleware(), h.GetAttendance)
 
 	// run server
 	r.Run(":8080")
